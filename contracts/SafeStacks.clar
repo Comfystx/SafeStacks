@@ -1,5 +1,6 @@
 ;; SafeStacks Multi-Sig Vault Contract
 ;; A secure multi-signature wallet implementation for teams and organizations
+;; Now supports SIP-010 fungible tokens in addition to STX
 
 ;; Error codes
 (define-constant ERR-NOT-AUTHORIZED (err u1001))
@@ -12,6 +13,21 @@
 (define-constant ERR-VAULT-LOCKED (err u1008))
 (define-constant ERR-INVALID-AMOUNT (err u1009))
 (define-constant ERR-INVALID-RECIPIENT (err u1010))
+(define-constant ERR-INVALID-TOKEN (err u1011))
+(define-constant ERR-TOKEN-TRANSFER-FAILED (err u1012))
+
+;; SIP-010 trait definition
+(define-trait sip-010-trait
+  (
+    (transfer (uint principal principal (optional (buff 34))) (response bool uint))
+    (get-name () (response (string-ascii 32) uint))
+    (get-symbol () (response (string-ascii 32) uint))
+    (get-decimals () (response uint uint))
+    (get-balance (principal) (response uint uint))
+    (get-total-supply () (response uint uint))
+    (get-token-uri () (response (optional (string-utf8 256)) uint))
+  )
+)
 
 ;; Data variables
 (define-data-var contract-owner principal tx-sender)
@@ -24,9 +40,14 @@
   {
     signers: (list 10 principal),
     threshold: uint,
-    balance: uint,
+    stx-balance: uint,
     is-active: bool
   }
+)
+
+(define-map vault-token-balances
+  { vault-id: uint, token-contract: principal }
+  { balance: uint }
 )
 
 (define-map vault-signers
@@ -39,6 +60,7 @@
   {
     recipient: principal,
     amount: uint,
+    token-contract: (optional principal),
     signatures: (list 10 principal),
     signature-count: uint,
     is-executed: bool,
@@ -68,11 +90,41 @@
   (and (> threshold u0) (<= threshold signers-count))
 )
 
+(define-private (validate-signer-principal (signer principal) (prev-valid bool))
+  (and prev-valid (is-valid-principal signer))
+)
+
+(define-private (add-vault-id (signer principal))
+  { signer: signer, vault-id: (+ (var-get transaction-nonce) u1) }
+)
+
+(define-private (set-vault-signer-mapping (signer-data { signer: principal, vault-id: uint }) (vault-id uint))
+  (begin
+    (map-set vault-signers
+      { vault-id: vault-id, signer: (get signer signer-data) }
+      { is-signer: true }
+    )
+    vault-id
+  )
+)
+
 ;; Read-only functions
 (define-read-only (get-vault-info (vault-id uint))
   (begin
     (asserts! (> vault-id u0) none)
     (map-get? vaults { vault-id: vault-id })
+  )
+)
+
+(define-read-only (get-vault-token-balance (vault-id uint) (token-contract principal))
+  (begin
+    (asserts! (> vault-id u0) u0)
+    (asserts! (is-valid-principal token-contract) u0)
+    (default-to u0 
+      (get balance 
+        (map-get? vault-token-balances { vault-id: vault-id, token-contract: token-contract })
+      )
+    )
   )
 )
 
@@ -118,7 +170,7 @@
 )
 
 (define-read-only (get-next-transaction-id)
-  (var-get transaction-nonce)
+  (+ (var-get transaction-nonce) u1)
 )
 
 ;; Public functions
@@ -141,7 +193,7 @@
       {
         signers: signers,
         threshold: threshold,
-        balance: u0,
+        stx-balance: u0,
         is-active: true
       }
     )
@@ -159,25 +211,7 @@
   )
 )
 
-(define-private (validate-signer-principal (signer principal) (prev-valid bool))
-  (and prev-valid (is-valid-principal signer))
-)
-
-(define-private (add-vault-id (signer principal))
-  { signer: signer, vault-id: (+ (var-get transaction-nonce) u1) }
-)
-
-(define-private (set-vault-signer-mapping (signer-data { signer: principal, vault-id: uint }) (vault-id uint))
-  (begin
-    (map-set vault-signers
-      { vault-id: vault-id, signer: (get signer signer-data) }
-      { is-signer: true }
-    )
-    vault-id
-  )
-)
-
-(define-public (deposit-to-vault (vault-id uint) (amount uint))
+(define-public (deposit-stx-to-vault (vault-id uint) (amount uint))
   (let
     (
       (vault-data (unwrap! (map-get? vaults { vault-id: vault-id }) ERR-TRANSACTION-NOT-FOUND))
@@ -193,14 +227,42 @@
     ;; Update vault balance
     (map-set vaults
       { vault-id: vault-id }
-      (merge vault-data { balance: (+ (get balance vault-data) amount) })
+      (merge vault-data { stx-balance: (+ (get stx-balance vault-data) amount) })
     )
     
     (ok true)
   )
 )
 
-(define-public (propose-transaction (vault-id uint) (recipient principal) (amount uint))
+(define-public (deposit-token-to-vault (vault-id uint) (amount uint) (token-contract <sip-010-trait>))
+  (let
+    (
+      (vault-data (unwrap! (map-get? vaults { vault-id: vault-id }) ERR-TRANSACTION-NOT-FOUND))
+      (token-principal (contract-of token-contract))
+      (current-balance (get-vault-token-balance vault-id token-principal))
+    )
+    (asserts! (> vault-id u0) ERR-TRANSACTION-NOT-FOUND)
+    (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+    (asserts! (get is-active vault-data) ERR-VAULT-LOCKED)
+    (asserts! (not (var-get emergency-locked)) ERR-VAULT-LOCKED)
+    (asserts! (is-valid-principal token-principal) ERR-INVALID-TOKEN)
+    
+    ;; Transfer token to contract
+    (match (contract-call? token-contract transfer amount tx-sender (as-contract tx-sender) none)
+      success (begin
+        ;; Update vault token balance
+        (map-set vault-token-balances
+          { vault-id: vault-id, token-contract: token-principal }
+          { balance: (+ current-balance amount) }
+        )
+        (ok true)
+      )
+      error ERR-TOKEN-TRANSFER-FAILED
+    )
+  )
+)
+
+(define-public (propose-stx-transaction (vault-id uint) (recipient principal) (amount uint))
   (let
     (
       (vault-data (unwrap! (map-get? vaults { vault-id: vault-id }) ERR-TRANSACTION-NOT-FOUND))
@@ -212,7 +274,7 @@
     (asserts! (is-valid-principal recipient) ERR-INVALID-RECIPIENT)
     (asserts! (get is-active vault-data) ERR-VAULT-LOCKED)
     (asserts! (not (var-get emergency-locked)) ERR-VAULT-LOCKED)
-    (asserts! (<= amount (get balance vault-data)) ERR-INVALID-AMOUNT)
+    (asserts! (<= amount (get stx-balance vault-data)) ERR-INVALID-AMOUNT)
     
     ;; Create pending transaction
     (map-set pending-transactions
@@ -220,6 +282,51 @@
       {
         recipient: recipient,
         amount: amount,
+        token-contract: none,
+        signatures: (list tx-sender),
+        signature-count: u1,
+        is-executed: false,
+        created-at: stacks-block-height
+      }
+    )
+    
+    ;; Record signature
+    (map-set transaction-signatures
+      { vault-id: vault-id, tx-id: tx-id, signer: tx-sender }
+      { has-signed: true }
+    )
+    
+    ;; Update nonce
+    (var-set transaction-nonce tx-id)
+    
+    (ok tx-id)
+  )
+)
+
+(define-public (propose-token-transaction (vault-id uint) (recipient principal) (amount uint) (token-contract <sip-010-trait>))
+  (let
+    (
+      (vault-data (unwrap! (map-get? vaults { vault-id: vault-id }) ERR-TRANSACTION-NOT-FOUND))
+      (tx-id (+ (var-get transaction-nonce) u1))
+      (token-principal (contract-of token-contract))
+      (token-balance (get-vault-token-balance vault-id token-principal))
+    )
+    (asserts! (> vault-id u0) ERR-TRANSACTION-NOT-FOUND)
+    (asserts! (is-vault-signer vault-id tx-sender) ERR-NOT-AUTHORIZED)
+    (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+    (asserts! (is-valid-principal recipient) ERR-INVALID-RECIPIENT)
+    (asserts! (is-valid-principal token-principal) ERR-INVALID-TOKEN)
+    (asserts! (get is-active vault-data) ERR-VAULT-LOCKED)
+    (asserts! (not (var-get emergency-locked)) ERR-VAULT-LOCKED)
+    (asserts! (<= amount token-balance) ERR-INVALID-AMOUNT)
+    
+    ;; Create pending transaction
+    (map-set pending-transactions
+      { vault-id: vault-id, tx-id: tx-id }
+      {
+        recipient: recipient,
+        amount: amount,
+        token-contract: (some token-principal),
         signatures: (list tx-sender),
         signature-count: u1,
         is-executed: false,
@@ -275,7 +382,7 @@
   )
 )
 
-(define-public (execute-transaction (vault-id uint) (tx-id uint))
+(define-public (execute-stx-transaction (vault-id uint) (tx-id uint))
   (let
     (
       (vault-data (unwrap! (map-get? vaults { vault-id: vault-id }) ERR-TRANSACTION-NOT-FOUND))
@@ -288,15 +395,16 @@
     (asserts! (>= (get signature-count tx-data) (get threshold vault-data)) ERR-INSUFFICIENT-VOTES)
     (asserts! (get is-active vault-data) ERR-VAULT-LOCKED)
     (asserts! (not (var-get emergency-locked)) ERR-VAULT-LOCKED)
-    (asserts! (<= (get amount tx-data) (get balance vault-data)) ERR-INVALID-AMOUNT)
+    (asserts! (is-none (get token-contract tx-data)) ERR-INVALID-TOKEN)
+    (asserts! (<= (get amount tx-data) (get stx-balance vault-data)) ERR-INVALID-AMOUNT)
     
-    ;; Execute transfer
+    ;; Execute STX transfer
     (try! (as-contract (stx-transfer? (get amount tx-data) tx-sender (get recipient tx-data))))
     
     ;; Update vault balance
     (map-set vaults
       { vault-id: vault-id }
-      (merge vault-data { balance: (- (get balance vault-data) (get amount tx-data)) })
+      (merge vault-data { stx-balance: (- (get stx-balance vault-data) (get amount tx-data)) })
     )
     
     ;; Mark transaction as executed
@@ -306,6 +414,47 @@
     )
     
     (ok true)
+  )
+)
+
+(define-public (execute-token-transaction (vault-id uint) (tx-id uint) (token-contract <sip-010-trait>))
+  (let
+    (
+      (vault-data (unwrap! (map-get? vaults { vault-id: vault-id }) ERR-TRANSACTION-NOT-FOUND))
+      (tx-data (unwrap! (map-get? pending-transactions { vault-id: vault-id, tx-id: tx-id }) ERR-TRANSACTION-NOT-FOUND))
+      (token-principal (contract-of token-contract))
+      (current-balance (get-vault-token-balance vault-id token-principal))
+    )
+    (asserts! (> vault-id u0) ERR-TRANSACTION-NOT-FOUND)
+    (asserts! (> tx-id u0) ERR-TRANSACTION-NOT-FOUND)
+    (asserts! (is-vault-signer vault-id tx-sender) ERR-NOT-AUTHORIZED)
+    (asserts! (not (get is-executed tx-data)) ERR-TRANSACTION-ALREADY-EXECUTED)
+    (asserts! (>= (get signature-count tx-data) (get threshold vault-data)) ERR-INSUFFICIENT-VOTES)
+    (asserts! (get is-active vault-data) ERR-VAULT-LOCKED)
+    (asserts! (not (var-get emergency-locked)) ERR-VAULT-LOCKED)
+    (asserts! (is-some (get token-contract tx-data)) ERR-INVALID-TOKEN)
+    (asserts! (is-eq token-principal (unwrap! (get token-contract tx-data) ERR-INVALID-TOKEN)) ERR-INVALID-TOKEN)
+    (asserts! (<= (get amount tx-data) current-balance) ERR-INVALID-AMOUNT)
+    
+    ;; Execute token transfer
+    (match (as-contract (contract-call? token-contract transfer (get amount tx-data) tx-sender (get recipient tx-data) none))
+      success (begin
+        ;; Update vault token balance
+        (map-set vault-token-balances
+          { vault-id: vault-id, token-contract: token-principal }
+          { balance: (- current-balance (get amount tx-data)) }
+        )
+        
+        ;; Mark transaction as executed
+        (map-set pending-transactions
+          { vault-id: vault-id, tx-id: tx-id }
+          (merge tx-data { is-executed: true })
+        )
+        
+        (ok true)
+      )
+      error ERR-TOKEN-TRANSFER-FAILED
+    )
   )
 )
 
