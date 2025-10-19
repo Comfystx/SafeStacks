@@ -1,6 +1,6 @@
 ;; SafeStacks Multi-Sig Vault Contract
 ;; A secure multi-signature wallet implementation for teams and organizations
-;; Now supports SIP-010 fungible tokens in addition to STX
+;; Supports STX, SIP-010 fungible tokens, and SIP-009 NFTs
 
 ;; Error codes
 (define-constant ERR-NOT-AUTHORIZED (err u1001))
@@ -15,6 +15,9 @@
 (define-constant ERR-INVALID-RECIPIENT (err u1010))
 (define-constant ERR-INVALID-TOKEN (err u1011))
 (define-constant ERR-TOKEN-TRANSFER-FAILED (err u1012))
+(define-constant ERR-INVALID-NFT (err u1013))
+(define-constant ERR-NFT-TRANSFER-FAILED (err u1014))
+(define-constant ERR-NFT-NOT-OWNED (err u1015))
 
 ;; SIP-010 trait definition
 (define-trait sip-010-trait
@@ -26,6 +29,16 @@
     (get-balance (principal) (response uint uint))
     (get-total-supply () (response uint uint))
     (get-token-uri () (response (optional (string-utf8 256)) uint))
+  )
+)
+
+;; SIP-009 NFT trait definition
+(define-trait sip-009-trait
+  (
+    (transfer (uint principal principal) (response bool uint))
+    (get-last-token-id () (response uint uint))
+    (get-token-uri (uint) (response (optional (string-ascii 256)) uint))
+    (get-owner (uint) (response (optional principal) uint))
   )
 )
 
@@ -50,6 +63,11 @@
   { balance: uint }
 )
 
+(define-map vault-nft-holdings
+  { vault-id: uint, nft-contract: principal, token-id: uint }
+  { owned: bool }
+)
+
 (define-map vault-signers
   { vault-id: uint, signer: principal }
   { is-signer: bool }
@@ -61,6 +79,9 @@
     recipient: principal,
     amount: uint,
     token-contract: (optional principal),
+    nft-contract: (optional principal),
+    nft-token-id: (optional uint),
+    transaction-type: (string-ascii 10),
     signatures: (list 10 principal),
     signature-count: uint,
     is-executed: bool,
@@ -123,6 +144,18 @@
     (default-to u0 
       (get balance 
         (map-get? vault-token-balances { vault-id: vault-id, token-contract: token-contract })
+      )
+    )
+  )
+)
+
+(define-read-only (get-vault-nft-owned (vault-id uint) (nft-contract principal) (token-id uint))
+  (begin
+    (asserts! (> vault-id u0) false)
+    (asserts! (is-valid-principal nft-contract) false)
+    (default-to false
+      (get owned
+        (map-get? vault-nft-holdings { vault-id: vault-id, nft-contract: nft-contract, token-id: token-id })
       )
     )
   )
@@ -262,6 +295,33 @@
   )
 )
 
+(define-public (deposit-nft-to-vault (vault-id uint) (nft-contract <sip-009-trait>) (token-id uint))
+  (let
+    (
+      (vault-data (unwrap! (map-get? vaults { vault-id: vault-id }) ERR-TRANSACTION-NOT-FOUND))
+      (nft-principal (contract-of nft-contract))
+      (contract-principal (as-contract tx-sender))
+    )
+    (asserts! (> vault-id u0) ERR-TRANSACTION-NOT-FOUND)
+    (asserts! (get is-active vault-data) ERR-VAULT-LOCKED)
+    (asserts! (not (var-get emergency-locked)) ERR-VAULT-LOCKED)
+    (asserts! (is-valid-principal nft-principal) ERR-INVALID-NFT)
+    
+    ;; Transfer NFT to contract
+    (match (contract-call? nft-contract transfer token-id tx-sender contract-principal)
+      success (begin
+        ;; Record NFT ownership
+        (map-set vault-nft-holdings
+          { vault-id: vault-id, nft-contract: nft-principal, token-id: token-id }
+          { owned: true }
+        )
+        (ok true)
+      )
+      error ERR-NFT-TRANSFER-FAILED
+    )
+  )
+)
+
 (define-public (propose-stx-transaction (vault-id uint) (recipient principal) (amount uint))
   (let
     (
@@ -283,6 +343,9 @@
         recipient: recipient,
         amount: amount,
         token-contract: none,
+        nft-contract: none,
+        nft-token-id: none,
+        transaction-type: "stx",
         signatures: (list tx-sender),
         signature-count: u1,
         is-executed: false,
@@ -327,6 +390,54 @@
         recipient: recipient,
         amount: amount,
         token-contract: (some token-principal),
+        nft-contract: none,
+        nft-token-id: none,
+        transaction-type: "token",
+        signatures: (list tx-sender),
+        signature-count: u1,
+        is-executed: false,
+        created-at: stacks-block-height
+      }
+    )
+    
+    ;; Record signature
+    (map-set transaction-signatures
+      { vault-id: vault-id, tx-id: tx-id, signer: tx-sender }
+      { has-signed: true }
+    )
+    
+    ;; Update nonce
+    (var-set transaction-nonce tx-id)
+    
+    (ok tx-id)
+  )
+)
+
+(define-public (propose-nft-transaction (vault-id uint) (recipient principal) (nft-contract <sip-009-trait>) (token-id uint))
+  (let
+    (
+      (vault-data (unwrap! (map-get? vaults { vault-id: vault-id }) ERR-TRANSACTION-NOT-FOUND))
+      (tx-id (+ (var-get transaction-nonce) u1))
+      (nft-principal (contract-of nft-contract))
+    )
+    (asserts! (> vault-id u0) ERR-TRANSACTION-NOT-FOUND)
+    (asserts! (is-vault-signer vault-id tx-sender) ERR-NOT-AUTHORIZED)
+    (asserts! (is-valid-principal recipient) ERR-INVALID-RECIPIENT)
+    (asserts! (is-valid-principal nft-principal) ERR-INVALID-NFT)
+    (asserts! (get is-active vault-data) ERR-VAULT-LOCKED)
+    (asserts! (not (var-get emergency-locked)) ERR-VAULT-LOCKED)
+    (asserts! (get-vault-nft-owned vault-id nft-principal token-id) ERR-NFT-NOT-OWNED)
+    
+    ;; Create pending transaction
+    (map-set pending-transactions
+      { vault-id: vault-id, tx-id: tx-id }
+      {
+        recipient: recipient,
+        amount: u0,
+        token-contract: none,
+        nft-contract: (some nft-principal),
+        nft-token-id: (some token-id),
+        transaction-type: "nft",
         signatures: (list tx-sender),
         signature-count: u1,
         is-executed: false,
@@ -395,7 +506,9 @@
     (asserts! (>= (get signature-count tx-data) (get threshold vault-data)) ERR-INSUFFICIENT-VOTES)
     (asserts! (get is-active vault-data) ERR-VAULT-LOCKED)
     (asserts! (not (var-get emergency-locked)) ERR-VAULT-LOCKED)
+    (asserts! (is-eq (get transaction-type tx-data) "stx") ERR-INVALID-TOKEN)
     (asserts! (is-none (get token-contract tx-data)) ERR-INVALID-TOKEN)
+    (asserts! (is-none (get nft-contract tx-data)) ERR-INVALID-NFT)
     (asserts! (<= (get amount tx-data) (get stx-balance vault-data)) ERR-INVALID-AMOUNT)
     
     ;; Execute STX transfer
@@ -432,7 +545,9 @@
     (asserts! (>= (get signature-count tx-data) (get threshold vault-data)) ERR-INSUFFICIENT-VOTES)
     (asserts! (get is-active vault-data) ERR-VAULT-LOCKED)
     (asserts! (not (var-get emergency-locked)) ERR-VAULT-LOCKED)
+    (asserts! (is-eq (get transaction-type tx-data) "token") ERR-INVALID-TOKEN)
     (asserts! (is-some (get token-contract tx-data)) ERR-INVALID-TOKEN)
+    (asserts! (is-none (get nft-contract tx-data)) ERR-INVALID-NFT)
     (asserts! (is-eq token-principal (unwrap! (get token-contract tx-data) ERR-INVALID-TOKEN)) ERR-INVALID-TOKEN)
     (asserts! (<= (get amount tx-data) current-balance) ERR-INVALID-AMOUNT)
     
@@ -454,6 +569,49 @@
         (ok true)
       )
       error ERR-TOKEN-TRANSFER-FAILED
+    )
+  )
+)
+
+(define-public (execute-nft-transaction (vault-id uint) (tx-id uint) (nft-contract <sip-009-trait>))
+  (let
+    (
+      (vault-data (unwrap! (map-get? vaults { vault-id: vault-id }) ERR-TRANSACTION-NOT-FOUND))
+      (tx-data (unwrap! (map-get? pending-transactions { vault-id: vault-id, tx-id: tx-id }) ERR-TRANSACTION-NOT-FOUND))
+      (nft-principal (contract-of nft-contract))
+      (nft-id (unwrap! (get nft-token-id tx-data) ERR-INVALID-NFT))
+    )
+    (asserts! (> vault-id u0) ERR-TRANSACTION-NOT-FOUND)
+    (asserts! (> tx-id u0) ERR-TRANSACTION-NOT-FOUND)
+    (asserts! (is-vault-signer vault-id tx-sender) ERR-NOT-AUTHORIZED)
+    (asserts! (not (get is-executed tx-data)) ERR-TRANSACTION-ALREADY-EXECUTED)
+    (asserts! (>= (get signature-count tx-data) (get threshold vault-data)) ERR-INSUFFICIENT-VOTES)
+    (asserts! (get is-active vault-data) ERR-VAULT-LOCKED)
+    (asserts! (not (var-get emergency-locked)) ERR-VAULT-LOCKED)
+    (asserts! (is-eq (get transaction-type tx-data) "nft") ERR-INVALID-NFT)
+    (asserts! (is-some (get nft-contract tx-data)) ERR-INVALID-NFT)
+    (asserts! (is-none (get token-contract tx-data)) ERR-INVALID-TOKEN)
+    (asserts! (is-eq nft-principal (unwrap! (get nft-contract tx-data) ERR-INVALID-NFT)) ERR-INVALID-NFT)
+    (asserts! (get-vault-nft-owned vault-id nft-principal nft-id) ERR-NFT-NOT-OWNED)
+    
+    ;; Execute NFT transfer
+    (match (as-contract (contract-call? nft-contract transfer nft-id tx-sender (get recipient tx-data)))
+      success (begin
+        ;; Remove NFT from vault holdings
+        (map-set vault-nft-holdings
+          { vault-id: vault-id, nft-contract: nft-principal, token-id: nft-id }
+          { owned: false }
+        )
+        
+        ;; Mark transaction as executed
+        (map-set pending-transactions
+          { vault-id: vault-id, tx-id: tx-id }
+          (merge tx-data { is-executed: true })
+        )
+        
+        (ok true)
+      )
+      error ERR-NFT-TRANSFER-FAILED
     )
   )
 )
